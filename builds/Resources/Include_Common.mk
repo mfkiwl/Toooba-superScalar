@@ -36,9 +36,11 @@ all: compile  simulator
 
 CORE_DIRS = $(REPO)/src_Core/CPU:$(REPO)/src_Core/ISA:$(REPO)/src_Core/Core:$(REPO)/src_Core/PLIC:$(REPO)/src_Core/Debug_Module:$(REPO)/src_Core/BSV_Additional_Libs
 
-TESTBENCH_DIRS  = $(REPO)/src_Testbench/Top:$(REPO)/src_Testbench/SoC:$(REPO)/src_Testbench/Fabrics/AXI4
+TESTBENCH_DIRS = $(REPO)/src_Testbench/Top:$(REPO)/src_Testbench/SoC:$(REPO)/src_Testbench/Fabrics/AXI4
 
-BSC_PATH = $(ALL_RISCY_DIRS):$(CORE_DIRS):$(TESTBENCH_DIRS):+
+BLUESTUFF_DIRS = $(REPO)/src_Core/BSV_Additional_Libs/BlueStuff:$(REPO)/src_Core/BSV_Additional_Libs/BlueStuff/BlueUtils:$(REPO)/src_Core/BSV_Additional_Libs/BlueStuff/BlueBasics
+
+BSC_PATH = $(ALL_RISCY_DIRS):$(CORE_DIRS):$(TESTBENCH_DIRS):$(BLUESTUFF_DIRS):+
 
 # ----------------
 # Top-level file and module
@@ -46,12 +48,18 @@ BSC_PATH = $(ALL_RISCY_DIRS):$(CORE_DIRS):$(TESTBENCH_DIRS):+
 TOPFILE   ?= $(REPO)/src_Testbench/Top/Top_HW_Side.bsv
 TOPMODULE ?= mkTop_HW_Side
 
+# ----------------
+# Target for Bluestuff submodules.
+$(REPO)/src_Core/BSV_Additional_Libs/BlueStuff/.git:
+	git submodule update --init --recursive
+
 # ================================================================
 # bsc compilation flags
 
 BSC_COMPILATION_FLAGS += \
-	-keep-fires -aggressive-conditions -no-warn-action-shadowing -no-show-timestamps -check-assert \
-	-suppress-warnings G0020    \
+	-keep-fires -aggressive-conditions -no-warn-action-shadowing -check-assert \
+	-suppress-warnings G0020 -steps-max-intervals 10000000   \
+	-steps-warn-interval 1000000 \
 	+RTS -K128M -RTS  -show-range-conflict
 
 # ================================================================

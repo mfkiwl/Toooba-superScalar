@@ -53,6 +53,7 @@ import MMIOInst::*;
 import IndexedMultiset::*;
 
 import Cur_Cycle :: *;
+import DReg :: *;
 
 // ================================================================
 // For fv_decode_C function and related types and definitions
@@ -97,6 +98,9 @@ interface FetchStage;
 
     // performance
     interface Perf#(DecStagePerfType) perf;
+`ifdef PERFORMANCE_MONITORING
+    method Bool redirect_evt;
+`endif
 endinterface
 
 // PC "compression" types to facilitate storing common upper PC bits in a
@@ -164,7 +168,10 @@ typedef struct {
 function InstrFromFetch3 fetch3_2_instC(Fetch3ToDecode in, Instruction inst, Bit#(32) orig_inst) =
    InstrFromFetch3 {
       pc: in.pc,
-      ppc: fromMaybe(PcCompressed{lsb: in.pc.lsb + 2, idx: in.pc.idx}, in.ppc), // This assumes we will call this function on the last fragment of any instruction.
+      // This assumes we will call this function on the last fragment of any instruction.
+      ppc: fromMaybe(PcCompressed{lsb: in.pc.lsb + 2,
+                                  idx: in.pc.idx + ((in.pc.lsb == -2) ? 1:0)}, // If we move to a new page, we will move to the next index in the compressed PC table.
+                     in.ppc),
       decode_epoch: in.decode_epoch,
       main_epoch: in.main_epoch,
       inst: inst,
@@ -256,20 +263,18 @@ module mkFetchStage(FetchStage);
     // Since CSR may be modified, sending wrong path request to TLB may cause problem
     // So we stall until the next redirection happens
     // The next redirect is either by the trap/system inst or an older one
-    Reg#(Bool) waitForRedirect <- mkReg(False);
-    // We don't want setWaitForRedirect method and redirect method to happen together
-    // make them conflict
-    RWire#(void) setWaitRedirect_redirect_conflict <- mkRWire;
+    Ehr#(2, Bool) waitForRedirect <- mkEhr(False);
 
     // Stall fetch during the flush triggered by the procesing trap/system inst in commit stage
     // We stall until the flush is done
-    Reg#(Bool) waitForFlush <- mkReg(False);
+    Ehr#(3, Bool) waitForFlush <- mkEhr(False);
 
-    Ehr#(4, Addr) pc_reg <- mkEhr(0);
+    Ehr#(5, Addr) pc_reg <- mkEhr(0);
     Integer pc_fetch1_port = 0;
     Integer pc_decode_port = 1;
     Integer pc_fetch3_port = 2;
     Integer pc_redirect_port = 3;
+    Integer pc_final_port = 4;
 
     // PC compression structure holding an indexed set of PC blocks so that only indexes need be tracked.
     IndexedMultiset#(PcIdx, PcMSB, SupSizeX2) pcBlocks <- mkIndexedMultisetQueue;
@@ -287,7 +292,7 @@ module mkFetchStage(FetchStage);
        // Can the fifo size be smaller?
 
     // Branch Predictors
-    NextAddrPred    nextAddrPred <- mkBtb;
+    let             nextAddrPred <- mkBtb;
     let             dirPred      <- mkDirPredictor;
     ReturnAddrStack ras          <- mkRas;
     // Wire to train next addr pred (NAP)
@@ -329,22 +334,24 @@ module mkFetchStage(FetchStage);
         });
     endrule
 `endif
+`ifdef PERFORMANCE_MONITORING
+    Reg#(Bool) redirect_evt_reg <- mkDReg(False);
+`endif
+
+    rule updatePcInBtb;
+        nextAddrPred.put_pc(pc_reg[pc_final_port]);
+    endrule
 
     // We don't send req to TLB when waiting for redirect or TLB flush. Since
     // there is no FIFO between doFetch1 and TLB, when OOO commit stage wait
     // TLB idle to change VM CSR / signal flush TLB, there is no wrong path
     // request afterwards to race with the system code that manage paget table.
-    rule doFetch1(started && !waitForRedirect && !waitForFlush);
+    rule doFetch1(started && !(waitForRedirect[0]) && !(waitForFlush[0]));
         let pc = pc_reg[pc_fetch1_port];
 
-        // Chain of prediction for the next instructions
-        // We need a BTB with a register file with enough ports!
-        // Instead of cascading predictions, we can always feed pc+4*i into
-        // predictor, because we will break superscaler fetch if nextpc != pc+4
-        Vector#(SupSizeX2, Maybe#(Addr)) pred_future_pc;
-        for(Integer i = 0; i < valueof(SupSizeX2); i = i+1) begin
-            pred_future_pc[i] = nextAddrPred.predPc(pc + fromInteger(2 * i));
-        end
+        // Grab a chain of predictions from the BTB, which predicts targets for the next
+        // set of addresses based on the current PC.
+        Vector#(SupSizeX2, Maybe#(Addr)) pred_future_pc = nextAddrPred.pred;
 
         // Next pc is the first nextPc that breaks the chain of pc+4 or
         // that is at the end of a cacheline.
@@ -374,7 +381,7 @@ module mkFetchStage(FetchStage);
             main_epoch: f_main_epoch};
 
         f12f2.enq(out);
-        if (verbose) $display("Fetch1: ", fshow(out), " posLastSupX2: %d", posLastSupX2);
+        if (verbose) $display("%d Fetch1: ", cur_cycle, fshow(out), " posLastSupX2: %d", posLastSupX2);
     endrule
 
     rule doFetch2;
@@ -503,7 +510,7 @@ module mkFetchStage(FetchStage);
                if (!validValue(new_pick).mispred_first_half) begin
                   doAssert(decompressPc(prev_frag.pc)+2 == decompressPc(frag.pc), "Attached fragments with non-contigious PCs");
                end
-            end else if (is_16b_inst(frag.inst_frag)) begin // 16-bit instruction
+            end else if (is_16b_inst(frag.inst_frag) || isValid(frag.cause)) begin // 16-bit instruction
                new_pick = tagged Valid fetch3_2_instC(frag,
                                                       fv_decode_C (misa, misa_mxl_64, frag.inst_frag),
                                                       zeroExtend(frag.inst_frag));
@@ -625,7 +632,7 @@ module mkFetchStage(FetchStage);
 
                   // check previous mispred
                   if (nextPc matches tagged Valid .decode_pred_next_pc &&& (decode_pred_next_pc != ppc)) begin
-                     if (verbose) $display("ppc and decodeppc :  %h %h", ppc, decode_pred_next_pc);
+                     if (verbose) $display("%x: ppc and decodeppc :  %h %h", pc, ppc, decode_pred_next_pc);
                      decode_epoch_local = !decode_epoch_local;
                      redirectPc = Valid (decode_pred_next_pc); // record redirect next pc
                      ppc = decode_pred_next_pc;
@@ -710,7 +717,7 @@ module mkFetchStage(FetchStage);
     // (1) Fetch1 is stalled for waiting flush
     // (2) all internal FIFOs are empty (the output sup fifo needs not to be
     // empty, but why leave this security hole)
-    Bool empty_for_flush = waitForFlush &&
+    Bool empty_for_flush = waitForFlush[0] &&
                            !f12f2.notEmpty && !f22f3.notEmpty &&
                            f32d.internalEmpty && out_fifo.internalEmpty;
 
@@ -722,39 +729,40 @@ module mkFetchStage(FetchStage);
     method Action start(Addr start_pc);
         pc_reg[0] <= start_pc;
         started <= True;
-        waitForRedirect <= False;
-        waitForFlush <= False;
+        waitForRedirect[0] <= False;
+        waitForFlush[0] <= False;
     endmethod
     method Action stop();
         started <= False;
     endmethod
 
     method Action setWaitRedirect;
-        waitForRedirect <= True;
-        setWaitRedirect_redirect_conflict.wset(?); // conflict with redirect
+        waitForRedirect[0] <= True;
     endmethod
     method Action redirect(Addr new_pc);
         if (verbose) $display("Redirect: newpc %h, old f_main_epoch %d, new f_main_epoch %d",new_pc,f_main_epoch,f_main_epoch+1);
         pc_reg[pc_redirect_port] <= new_pc;
         f_main_epoch <= (f_main_epoch == fromInteger(valueOf(NumEpochs)-1)) ? 0 : f_main_epoch + 1;
         // redirect comes, stop stalling for redirect
-        waitForRedirect <= False;
-        setWaitRedirect_redirect_conflict.wset(?); // conflict with setWaitForRedirect
+        waitForRedirect[1] <= False;
         // this redirect may be caused by a trap/system inst in commit stage
         // we conservatively set wait for flush TODO make this an input parameter
-        waitForFlush <= True;
+        waitForFlush[2] <= True;
+`ifdef PERFORMANCE_MONITORING
+        redirect_evt_reg <= True;
+`endif
     endmethod
 
 `ifdef INCLUDE_GDB_CONTROL
    method Action setWaitFlush;
-      waitForFlush <= True;
+      waitForFlush[1] <= True;
       // $display ("%0d.%m.setWaitFlush", cur_cycle);
    endmethod
 `endif
 
-    method Action done_flushing() if (waitForFlush);
+    method Action done_flushing() if (waitForFlush[0]);
         // signal that the pipeline can resume fetching
-        waitForFlush <= False;
+        waitForFlush[0] <= False;
         // XXX The guard prevents the readyToFetch rule in Core.bsv from firing every cycle
         // The guard also makes this method sequence before (restricted) redirect method
         // So the effect of setting waitForFlush in redirect method will not be overwritten
@@ -800,8 +808,8 @@ module mkFetchStage(FetchStage);
     method FetchDebugState getFetchState;
         return FetchDebugState {
             pc: pc_reg[0],
-            waitForRedirect: waitForRedirect,
-            waitForFlush: waitForFlush,
+            waitForRedirect: waitForRedirect[0],
+            waitForFlush: waitForFlush[0],
             mainEp: f_main_epoch
         };
     endmethod
@@ -838,4 +846,8 @@ module mkFetchStage(FetchStage);
         method Bool respValid = perfReqQ.notEmpty;
 `endif
     endinterface
+
+`ifdef PERFORMANCE_MONITORING
+    method Bool redirect_evt = redirect_evt_reg._read;
+`endif
 endmodule
